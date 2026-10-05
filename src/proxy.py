@@ -26,7 +26,7 @@ same both inside and outside containers.
 All remaining data is forward directly without modification both ways.
 """
 
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from socket import SO_PEERCRED, SOL_SOCKET
 from asyncio import StreamReader, StreamWriter
@@ -35,6 +35,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import struct
 
 from opts import Options, get_opts
@@ -211,7 +212,7 @@ async def client_callback(
 
         await handle_client(auth_data, reader, writer, dbus_soc, buffer_size)
     except PermissionError as e:
-        logging.warn(f"Permission Denied: {e}")
+        logging.warning(f"Permission Denied: {e}")
     finally:
         await writer.drain()
         writer.close()
@@ -269,8 +270,19 @@ async def run_proxy(opts: Options) -> None:
     await server.serve_forever()
 
 
+def handle_sigterm(signum, frame) -> None:
+    """
+    Treats SIGTERM like Ctrl-C. As PID 1 in a container the process has no
+    default SIGTERM handler, so without this `podman stop` has to SIGKILL it.
+    Further SIGTERMs are ignored so they can't interrupt the shutdown cleanup.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
     opts = get_opts()
+    signal.signal(signal.SIGTERM, handle_sigterm)
     try:
         if os.path.exists(opts.client_socket):
             os.remove(opts.client_socket)
