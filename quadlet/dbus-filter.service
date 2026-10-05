@@ -1,0 +1,15 @@
+[Unit]
+Description=Filtering D-Bus proxy for the system bus (xdg-dbus-proxy)
+
+[Service]
+# Keep the directory across restarts so the bind mount in the
+# dbus-auth-proxy container stays valid.
+RuntimeDirectory=dbus-filter
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/bin/rm -f %t/dbus-filter/bus
+# Add a --talk=/--see=/--own= (or --call=) rule for each name the client needs.
+ExecStart=/usr/bin/xdg-dbus-proxy unix:path=/run/dbus/system_bus_socket %t/dbus-filter/bus --filter --talk=org.bluez
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

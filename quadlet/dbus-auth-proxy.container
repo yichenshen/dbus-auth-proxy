@@ -1,11 +1,9 @@
 [Unit]
 Description=DBus Auth Proxy Container
-Requires=dbus.service
-After=dbus.service
 
 [Container]
-Image=ghcr.io/yichenshen/dbus-auth-proxy:latest
-AutoUpdate=registry
+# Built locally from this checkout by dbus-auth-proxy.build; never pulled.
+Image=dbus-auth-proxy.build
 
 Volume=dbus-socket:/run/dbus-auth-proxy:rw
 Volume=/run/dbus:/run/dbus:rw
