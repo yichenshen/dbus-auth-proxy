@@ -1,0 +1,8 @@
+[Unit]
+Description=Build DBus Auth Proxy image from local checkout
+
+[Build]
+ImageTag=localhost/dbus-auth-proxy:latest
+# @REPO_DIR@ is replaced with the absolute checkout path by install.sh
+File=@REPO_DIR@/Containerfile
+SetWorkingDirectory=@REPO_DIR@

@@ -23,43 +23,47 @@ the true system dbus.
 All three UID (client connection/AUTH/dbus connection) will then be seen as the
 same both inside and outside containers.
 
-All remaining data is forward directly without modification both ways.
+All remaining data, including file descriptors passed along with it, is
+forwarded directly without modification both ways.
 """
 
-from typing import Callable, Optional
+from array import array
+from typing import Awaitable, Callable, List, Optional, Tuple
 
-from socket import SO_PEERCRED, SOL_SOCKET
-from asyncio import StreamReader, StreamWriter
+from socket import SCM_RIGHTS, SO_PEERCRED, SOL_SOCKET
 
 import asyncio
 import logging
 import os
 import re
+import signal
+import socket
 import struct
 
 from opts import Options, get_opts
 
 PROCESS_UID = os.getuid()
 REPLACEMENT_UID_HEX = str(PROCESS_UID).encode("ascii").hex().encode()
+# Most file descriptors the kernel passes in a single message (SCM_MAX_FD).
+MAX_FDS = 253
+# Same limit dbus-daemon applies to an auth line. The first line is read
+# before the client's UID is rejected, so it must be bounded.
+MAX_AUTH_LINE = 16 * 1024
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
-def get_socket_uid(writer: StreamWriter) -> Optional[int]:
+def get_socket_uid(sock: socket.socket) -> Optional[int]:
     """
-    Pulls out the UID of the client of the socket backing writer.
+    Pulls out the UID of the client of the socket.
 
     Args:
-        writer (StreamWriter): The writer for the socket of the connection
+        sock (socket): The socket of the connection
     Returns:
         Optional[int]: The UID of the client of the connection if found
     """
-    sock = writer.get_extra_info("socket")
-    if sock is None:
-        return None
-
     try:
         peercred_bytes = sock.getsockopt(
             SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i")
@@ -104,31 +108,224 @@ def verify_and_transform(data: bytes, socket_uid: int) -> bytes:
     )
 
 
-async def forward(
-    from_stream: StreamReader, to_stream: StreamWriter, buffer_size: int
-) -> None:
+async def wait_ready(sock: socket.socket, writable: bool) -> None:
     """
-    Forwards data from one stream to another with bufferring.
+    Waits until the non-blocking socket is readable (or writable).
 
     Args:
-        from_stream (StreamReader): The stream to forward from
-        to_stream (StreamReader): The stream to forward to
-        buffer_size (int): Size of the buffer to use
+        sock (socket): The socket to wait on
+        writable (bool): Wait for writability instead of readability
     """
-    while not from_stream.at_eof():
-        data = await from_stream.read(buffer_size)
-        if not data:
-            break
-        to_stream.write(data)
-        await to_stream.drain()
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    add, remove = (
+        (loop.add_writer, loop.remove_writer)
+        if writable
+        else (loop.add_reader, loop.remove_reader)
+    )
+    add(sock.fileno(), lambda: ready.done() or ready.set_result(None))
+    try:
+        await ready
+    finally:
+        remove(sock.fileno())
 
-    await to_stream.drain()
+
+async def recv_with_fds(
+    sock: socket.socket, buffer_size: int
+) -> Tuple[bytes, List[int]]:
+    """
+    Receives data and any file descriptors passed along with it.
+
+    Args:
+        sock (socket): The non-blocking socket to read from
+        buffer_size (int): Most bytes to read at once
+    Returns:
+        Tuple[bytes, List[int]]: The data (empty on EOF) and the received fds,
+        which the caller must close
+    """
+    while True:
+        try:
+            data, fds, flags, _ = socket.recv_fds(sock, buffer_size, MAX_FDS)
+        except (BlockingIOError, InterruptedError):
+            await wait_ready(sock, writable=False)
+            continue
+        if flags & socket.MSG_CTRUNC:
+            for fd in fds:
+                os.close(fd)
+            raise ConnectionError("Too many file descriptors in one message")
+        return data, fds
+
+
+async def send_with_fds(sock: socket.socket, data: bytes, fds: List[int]) -> None:
+    """
+    Sends all of data, passing fds along with its first byte.
+
+    Args:
+        sock (socket): The non-blocking socket to write to
+        data (bytes): The data to send
+        fds (List[int]): File descriptors to pass, still owned by the caller
+    """
+    ancillary = [(SOL_SOCKET, SCM_RIGHTS, array("i", fds))] if fds else []
+    view = memoryview(data)
+    while view:
+        try:
+            sent = sock.sendmsg([view], ancillary)
+        except (BlockingIOError, InterruptedError):
+            await wait_ready(sock, writable=True)
+            continue
+        view = view[sent:]
+        ancillary = []
+
+
+async def recv_exact(sock: socket.socket, size: int) -> Tuple[bytes, List[int]]:
+    """
+    Receives exactly size bytes (fewer on EOF) and any fds passed with them.
+
+    Never reading past the requested size keeps fds tied to the D-Bus message
+    they were sent with, since the kernel may otherwise merge the end of one
+    message with the start of the next into a single read.
+
+    Args:
+        sock (socket): The socket to read from
+        size (int): Number of bytes to read
+    Returns:
+        Tuple[bytes, List[int]]: The data and the received fds, which the
+        caller must close
+    """
+    data, fds = b"", []
+    try:
+        while len(data) < size:
+            chunk, chunk_fds = await recv_with_fds(sock, size - len(data))
+            fds += chunk_fds
+            if not chunk:
+                break
+            data += chunk
+    except BaseException:
+        # Also on cancellation, which happens when the other direction ends.
+        for fd in fds:
+            os.close(fd)
+        raise
+    return data, fds
+
+
+async def read_line(sock: socket.socket) -> bytes:
+    """
+    Reads one auth line (up to and including "\\n", or until EOF).
+
+    Reads byte by byte so nothing past the line is consumed.
+
+    Args:
+        sock (socket): The socket to read from
+    Returns:
+        bytes: The line
+    """
+    line = b""
+    while not line.endswith(b"\n"):
+        if len(line) >= MAX_AUTH_LINE:
+            raise ConnectionError("Auth line too long")
+        byte, fds = await recv_exact(sock, 1)
+        for fd in fds:
+            os.close(fd)
+        if not byte:
+            break
+        line += byte
+    return line
+
+
+async def forward_auth(
+    from_sock: socket.socket, to_sock: socket.socket, from_client: bool
+) -> Optional[Tuple[bytes, List[int]]]:
+    """
+    Forwards auth lines until the binary message stream starts.
+
+    The client's stream switches to messages after its BEGIN line. The bus
+    sends no BEGIN, but its lines never start with a message's endianness
+    byte ("l" or "B").
+
+    Args:
+        from_sock (socket): The socket to forward from
+        to_sock (socket): The socket to forward to
+        from_client (bool): Whether from_sock is the client
+    Returns:
+        Optional[Tuple[bytes, List[int]]]: Bytes of the first message already
+        read and the fds passed with them, or None on EOF
+    """
+    while True:
+        if from_client:
+            line = await read_line(from_sock)
+            if not line:
+                return None
+            await send_with_fds(to_sock, line, [])
+            if line.split()[:1] == [b"BEGIN"]:
+                return b"", []
+        else:
+            # Fds belong to the first byte of a message, so keep them here.
+            first, fds = await recv_exact(from_sock, 1)
+            if first in (b"l", b"B"):
+                return first, fds
+            for fd in fds:
+                os.close(fd)
+            if not first:
+                return None
+            await send_with_fds(to_sock, first + await read_line(from_sock), [])
+
+
+async def forward(
+    from_sock: socket.socket,
+    to_sock: socket.socket,
+    buffer_size: int,
+    from_client: bool,
+) -> None:
+    """
+    Forwards auth lines, then D-Bus messages one at a time with the fds
+    passed along with each.
+
+    Args:
+        from_sock (socket): The socket to forward from
+        to_sock (socket): The socket to forward to
+        buffer_size (int): Size of the buffer to use
+        from_client (bool): Whether from_sock is the client
+    """
+    started = await forward_auth(from_sock, to_sock, from_client)
+    if started is None:
+        return
+    start, fds = started
+
+    while True:
+        try:
+            header, more_fds = await recv_exact(from_sock, 16 - len(start))
+            header, fds, start = start + header, fds + more_fds, b""
+            if len(header) < 16:
+                return
+            order = {b"l": "<", b"B": ">"}.get(header[:1])
+            if order is None:
+                raise ConnectionError("Invalid D-Bus message")
+            body_len, _, fields_len = struct.unpack_from(order + "3I", header, 4)
+            # Header fields are padded to a multiple of 8 before the body.
+            remaining = (fields_len + 7) // 8 * 8 + body_len
+            await send_with_fds(to_sock, header, fds)
+        finally:
+            for fd in fds:
+                os.close(fd)
+            fds = []
+
+        while remaining:
+            data, data_fds = await recv_with_fds(
+                from_sock, min(remaining, buffer_size)
+            )
+            try:
+                if not data:
+                    return
+                await send_with_fds(to_sock, data, data_fds)
+            finally:
+                for fd in data_fds:
+                    os.close(fd)
+            remaining -= len(data)
 
 
 async def handle_client(
     auth_data: bytes,
-    upstream_reader: StreamReader,
-    upstream_writer: StreamWriter,
+    client_sock: socket.socket,
     dbus_soc: str,
     buffer_size: int,
 ) -> None:
@@ -144,41 +341,46 @@ async def handle_client(
 
     Args:
         auth_data (bytes): The firest message from the client, the AUTH message
-        upstream_reader (streamreader): reader of data from the client
-        upstream_writer (streamwriter): writer of data to the client
+        client_sock (socket): socket of the client connection
         dbus_soc (str): path to the real dbus socket
         buffer_size (int): size of the buffer to use while forwarding to and
                            from the client
     """
     logging.debug(f"Opening connection to system dbus at: {dbus_soc}")
-    (downstream_reader, downstream_writer) = (
-        await asyncio.open_unix_connection(path=dbus_soc)
-    )
+    dbus_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dbus_sock.setblocking(False)
+    await asyncio.get_running_loop().sock_connect(dbus_sock, dbus_soc)
 
     logging.debug("dbus connection established, fowarding AUTH message")
-    downstream_writer.write(auth_data)
-    await downstream_writer.drain()
+    await send_with_fds(dbus_sock, auth_data, [])
 
     dbus_to_client = asyncio.create_task(
-        forward(downstream_reader, upstream_writer, buffer_size)
+        forward(dbus_sock, client_sock, buffer_size, from_client=False)
     )
     client_to_dbus = asyncio.create_task(
-        forward(upstream_reader, downstream_writer, buffer_size)
+        forward(client_sock, dbus_sock, buffer_size, from_client=True)
     )
 
     logging.debug("Bi-directional stream established")
-    await asyncio.wait(
+    done, pending = await asyncio.wait(
         {dbus_to_client, client_to_dbus}, return_when=asyncio.FIRST_COMPLETED
     )
     logging.debug("Bi-directional stream ended")
+    for task in done:
+        if task.exception():
+            logging.debug(f"Forwarding ended: {task.exception()}")
 
-    downstream_writer.close()
-    await downstream_writer.wait_closed()
+    # Stop the other direction before its socket is closed under it.
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    dbus_sock.close()
     logging.debug("System dbus connection closed")
 
 
 async def client_callback(
-    reader: StreamReader, writer: StreamWriter, dbus_soc: str, buffer_size: int
+    sock: socket.socket, dbus_soc: str, buffer_size: int
 ) -> None:
     """
     Callback to handle a new client connection.
@@ -187,59 +389,55 @@ async def client_callback(
     data both ways after that.
 
     Args:
-        reader (streamreader): reader of data from the client
-        writer (streamwriter): writer of data to the client
+        sock (socket): socket of the client connection
         dbus_soc (str): path to the real dbus socket
         buffer_size (int): size of the buffer to use while forwarding to and
                            from the client
     """
     logging.debug("Accepted connection from client")
-    socket_uid = get_socket_uid(writer)
+    socket_uid = get_socket_uid(sock)
     logging.debug(f"Client user id: {socket_uid}")
     if socket_uid is None:
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        sock.close()
         return
 
     try:
-        auth_data = await reader.readline()
+        auth_data = await read_line(sock)
         auth_data = verify_and_transform(auth_data, socket_uid)
 
         logging.debug(f"Verification complete and UID fixed to {PROCESS_UID}")
         logging.debug("Will begin forwarding data")
 
-        await handle_client(auth_data, reader, writer, dbus_soc, buffer_size)
+        await handle_client(auth_data, sock, dbus_soc, buffer_size)
     except PermissionError as e:
-        logging.warn(f"Permission Denied: {e}")
+        logging.warning(f"Permission Denied: {e}")
+    except ConnectionError as e:
+        logging.warning(f"Connection closed: {e}")
     finally:
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        sock.close()
 
 
 def gen_client_callback(
     dbus_soc: str, buffer_size: int
-) -> Callable[[StreamReader, StreamWriter], Awaitable[None]]:
+) -> Callable[[socket.socket], Awaitable[None]]:
     """
     Higher order function that generates a callback for the client connection
-    acceptor, meant to be used with asyncio's start_unix_server.
+    acceptor.
 
     This function bascially bakes in context required to handle forwarding and
-    returns a function that only takes in reader and writer from the client
-    socket.
+    returns a function that only takes in the client socket.
 
     Args:
         dbus_soc (str): path to the real dbus socket
         buffer_size (int): size of the buffer to use while forwarding to and
                            from the client
     Returns:
-        Callable[[StreamReader, StreamWriter], Awaitable[None]]:
+        Callable[[socket.socket], Awaitable[None]]:
             A callback suitable for the server acceptor
     """
 
-    async def callback(reader: StreamReader, writer: StreamWriter) -> None:
-        await client_callback(reader, writer, dbus_soc, buffer_size)
+    async def callback(sock: socket.socket) -> None:
+        await client_callback(sock, dbus_soc, buffer_size)
 
     return callback
 
@@ -259,18 +457,37 @@ async def run_proxy(opts: Options) -> None:
         os.remove(opts.client_socket)
 
     handle_client = gen_client_callback(opts.system_dbus, opts.buffer_size)
-    server = await asyncio.start_unix_server(
-        handle_client, path=opts.client_socket
-    )
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(opts.client_socket)
+    server.listen()
+    server.setblocking(False)
 
     logging.info(f"Proxy listening on {opts.client_socket}")
     logging.info(f"Forwarding to {opts.system_dbus}")
 
-    await server.serve_forever()
+    loop = asyncio.get_running_loop()
+    clients = set()
+    while True:
+        sock, _ = await loop.sock_accept(server)
+        sock.setblocking(False)
+        task = asyncio.create_task(handle_client(sock))
+        clients.add(task)
+        task.add_done_callback(clients.discard)
+
+
+def handle_sigterm(signum, frame) -> None:
+    """
+    Treats SIGTERM like Ctrl-C. As PID 1 in a container the process has no
+    default SIGTERM handler, so without this `podman stop` has to SIGKILL it.
+    Further SIGTERMs are ignored so they can't interrupt the shutdown cleanup.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":
     opts = get_opts()
+    signal.signal(signal.SIGTERM, handle_sigterm)
     try:
         if os.path.exists(opts.client_socket):
             os.remove(opts.client_socket)

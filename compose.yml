@@ -1,7 +1,12 @@
 services:
   dbus-auth-proxy:
-    image: ghcr.io/yichenshen/dbus-auth-proxy:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/dbus-auth-proxy:latest
+    pull_policy: build
     container_name: dbus-auth-proxy
+    userns_mode: keep-id
     volumes:
       - dbus-socket:/run/dbus-auth-proxy:rw
       - /run/dbus:/run/dbus:rw
